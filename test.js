@@ -8,7 +8,7 @@ const CoinView = require('bcoin/lib/coins/coinview')
 
 const BitcoreNodeCompatibilityLayer = require('.')
 
-describe('BitcoreNodeCompatibilityLayer', () => {
+describe('BitcoreNodeCompatibilityLayer', function () {
   const node = new FullNode({
     db: 'memory',
     network: 'regtest',
@@ -25,28 +25,39 @@ describe('BitcoreNodeCompatibilityLayer', () => {
   const client = new RPCClient({ network: 'regtest' })
 
   const blocks = []
-  const addresses = []
-  const txs = []
+  const receives = []
+  const changes = []
+  const unconfirmed = []
+  const confirmed = []
 
   let wallet
 
   const mineBlock = async () => {
+    miner.addresses.length = 0
+    changes.push(wallet.getChange())
+    miner.addAddress(changes[changes.length-1])
     const job = await miner.createJob()
-    job.addTX(txs[txs.length-1], new CoinView())
+    let tx
+    while (tx = unconfirmed.pop()) {
+      job.addTX(tx, new CoinView())
+      confirmed.push(tx)
+    }
     job.refresh()
     blocks.push(await job.mineAsync())
     await chain.add(blocks[blocks.length-1])
     await walletdb.rescan()
   }
 
-  const sendTransaction = async () => {
-    addresses.push(wallet.getReceive())
-    txs.push(await wallet.send({
-      outputs: [{
-        address: addresses[addresses.length-1],
-        value: 12*1e8
-      }]
-    }))
+  const sendTransactions = async (n) => {
+    receives.push(wallet.getReceive())
+    while (n--) {
+      unconfirmed.push(await wallet.send({
+        outputs: [{
+          address: receives[receives.length-1],
+          value: 25*1e8
+        }]
+      }))
+    }
     await walletdb.rescan()
   }
 
@@ -58,19 +69,14 @@ describe('BitcoreNodeCompatibilityLayer', () => {
 
   it('should open walletdb', async () => {
     wallet = await walletdb.create()
-    miner.addresses.length = 0
-    addresses.push(wallet.getReceive())
-    miner.addAddress(addresses[0])
   })
 
   it('should mine an empty block', async () => {
-    blocks.push(await miner.mineBlock())
-    await chain.add(blocks[0])
-    await walletdb.rescan()
+    blocks.push(await mineBlock())
   })
 
-  it('should fail to receive txs by address', async () => {
-    await sendTransaction()
+  it('should fail to receive tx ids by address', async () => {
+    await sendTransactions(1)
     try {
       await client.execute('getaddresstxids', [{}])
     } catch (err) {
@@ -78,43 +84,76 @@ describe('BitcoreNodeCompatibilityLayer', () => {
     }
   })
 
-  it('should receive txs in mempool by address', async () => {
+  it('should receive tx ids in mempool by address', async () => {
     const res = await client.execute('getaddresstxids', [{
-      addresses: [addresses[1].toString()]
+      addresses: [receives[0].toString()]
     }])
-    assert(res[0] === txs[0].rhash().toString('hex'))
+    assert(res[0] === unconfirmed[0].rhash().toString('hex'))
   })
 
-  it('should receive txs in db by address', async () => {
-    await mineBlock() 
+  it('should receive tx ids in db by address', async () => {
+    await mineBlock()
     const res = await client.execute('getaddresstxids', [{
-      addresses: [addresses[1].toString()],
+      addresses: [receives[0].toString()],
       start: 0,
       end: 2
     }])
-    assert(res[0] === txs[0].rhash().toString('hex'))
+    assert(res[0] === confirmed[0].rhash().toString('hex'))
   })
 
-  it('should receive no txs in db by address (bad range)', async () => {
+  it('should receive no tx ids in db by address (bad range)', async () => {
     const res = await client.execute('getaddresstxids', [{
-      addresses: [addresses[1].toString()],
+      addresses: [receives[0].toString()],
       start: 3
     }])
     assert(!res.length)
   })
 
-  it('should receive many txs for many addresses', async () => {
-    await sendTransaction() 
+  it('should receive many tx ids for many addresses', async () => {
+    await sendTransactions(1)
     await mineBlock()
     const res = await client.execute('getaddresstxids', [{
       addresses: [
-        addresses[1].toString(),
-        addresses[2].toString()
+        receives[0].toString(),
+        receives[1].toString()
       ],
       start: 0
     }])
-    assert(res[0] === txs[0].rhash().toString('hex'))
-    assert(res[1] === txs[1].rhash().toString('hex'))
+    assert(res[0] === confirmed[0].rhash().toString('hex'))
+    assert(res[1] === confirmed[1].rhash().toString('hex'))
+  })
+
+  it('should receive many deltas for many addresses', async () => {
+    await sendTransactions(1)
+    await mineBlock()
+    const addresses = [
+      changes[0].toString(),
+      receives[0].toString()
+    ]
+    const res = await client.execute('getaddressdeltas', [{
+      addresses,
+      start: 0
+    }])
+
+    const assertDelta =
+      async (delta, address, index, satoshis) => {
+        const hash = await chain.db.getHash(delta.height)
+        const block = await node.getBlock(hash)
+        const tx = block.txs[delta.blockIndex]
+        const meta = await node.getMeta(tx.hash().toString('hex'))
+        assert(JSON.stringify(delta) === JSON.stringify({
+          txid: tx.rhash().toString('hex'),
+          blockIndex: meta.index,
+          height: meta.height,
+          address,
+          index,
+          satoshis
+        }))
+      }
+
+    await assertDelta(res[0], addresses[0], 0, 50 * 1e8)
+    await assertDelta(res[1], addresses[0], 0, 50 * -1e8)
+    await assertDelta(res[2], addresses[1], 1, 25 * 1e8)
   })
 
   it('should cleanup', async () => {
