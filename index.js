@@ -19,12 +19,15 @@ class BitcoreNodeCompatibilityLayer {
     })
     Object.getOwnPropertyNames(Object.getPrototypeOf(this))
       .filter((name) => name[0] === '_')
-      .map((name) => this[name] = this[name].bind(this))
+      .map((name) => { this[name] = this[name].bind(this) })
   }
 
   open () {
     this.rpc.add('getaddresstxids', this._getAddressTxIds)
     this.rpc.add('getaddressdeltas', this._getAddressDeltas)
+    this.rpc.add('getaddressbalance', this._getAddressBalance)
+    this.rpc.add('getaddressutxos', this._getAddressUtxos)
+    this.rpc.add('getaddressmempool', this._getAddressMempool)
   }
 
   close () {
@@ -53,64 +56,82 @@ class BitcoreNodeCompatibilityLayer {
     return { addresses, start, end }
   }
 
+  async getAddressMetas (addresses, start, end) {
+    if (this.chain.options.spv) {
+      throw new RPCError('Cannot get TX in SPV mode.')
+    }
+
+    const metas = await Promise.all(addresses.map(async (address) => {
+      const metas =
+        await this.node.getMetaByAddress(address)
+
+      return metas
+        .filter((meta) => (
+          meta.height >= start && meta.height <= end
+        ))
+        .map((meta) => ({
+          meta,
+          address
+        }))
+    }))
+
+    return metas.reduce((res, cur) => res.concat(cur), [])
+  }
+
   async getAddressTxs (addresses, start, end) {
     if (this.chain.options.spv) {
       throw new RPCError('Cannot get TX in SPV mode.')
     }
 
-    return Promise.all(addresses.map(async (address) => {
-      const result = []
+    const metas =
+      await this.getAddressMetas(addresses, start, end)
 
-      const metas = await this.node.getMetaByAddress(address)
-      const rangedMetas = metas.filter((meta) => (
-        meta.height >= start && meta.height <= end
-      ))
-
-      for (let meta, view, i = 0; i < rangedMetas.length; i++) {
-        meta = rangedMetas[i]
-        view = await this.node.getMetaView(meta)
-
-        result.push({
-          tx: meta.getJSON(this.network, view),
+    const txs = await Promise.all(metas
+      .map(async ({ meta, address }) => {
+        const view = await this.node.getMetaView(meta)
+        const jsonTX = meta.getJSON(this.network, view)
+        if (!jsonTX.ts) {
+          jsonTX.ts = this.mempool.getEntry(meta.tx.hash('hex')).ts
+        }
+        return {
+          tx: jsonTX,
           address
-        })
-      }
+        }
+      }))
 
-      return result
-    }))
+    return txs
   }
 
-  getTxDeltas (tx, address) {
-    const txid = tx.hash
-    const blockIndex = tx.index
-    const height = tx.height
-
-    const base = {
-      txid,
-      blockIndex,
-      height,
-      address
-    }
-
+  getTxDeltas (base, tx, exclude) {
     return tx.inputs.map((input, index) => {
       if (input.coin && input.coin.address &&
-        input.coin.address === address) {
+        input.coin.address === base.address) {
         return Object.assign({}, base, {
           index,
-          satoshis: parseFloat(input.coin.value) * -1e8
+          satoshis: parseFloat(input.coin.value) * -1e8,
+          prevtxid: input.prevout.hash,
+          prevout: input.prevout.index
         })
       }
       return null
     }).filter((notNull) => notNull)
-    .concat(tx.outputs.map((output, index) => {
-      if (output.address && output.address === address) {
-        return Object.assign({}, base, {
-          index,
-          satoshis: parseFloat(output.value) * 1e8
-        })
-      }
-      return null
-    }).filter((notNull) => notNull))
+      .concat(tx.outputs.map((output, index) => {
+        if (output.address && output.address === base.address) {
+          return Object.assign({}, base, {
+            index,
+            satoshis: parseFloat(output.value) * 1e8
+          })
+        }
+        return null
+      }).filter((notNull) => notNull))
+      .map((delta) => {
+        if (exclude) {
+          exclude.map((key) => {
+            delete delta[key]
+          })
+        }
+        return delta
+      })
   }
 
   async _getAddressTxIds (args, help) {
@@ -128,9 +149,7 @@ class BitcoreNodeCompatibilityLayer {
     const txs =
       await this.getAddressTxs(addresses, start, end)
 
-    return txs
-      .reduce((res, cur) => res.concat(cur), [])
-      .map(({ tx }) => tx.hash)
+    return txs.map(({ tx }) => tx.hash)
   }
 
   async _getAddressDeltas (args, help) {
@@ -146,15 +165,110 @@ class BitcoreNodeCompatibilityLayer {
       this.validateArgs(args)
 
     const txs =
-      await this.getAddressTxs(addresses, start, end)
+      await this.getAddressTxs(addresses,
+        start === -1 ? 0 : start, end)
 
     return txs
-      .reduce((res, cur) => res.concat(cur), [])
       .map(({ tx, address }) => (
-        this.getTxDeltas(tx, address.toString())
+        this.getTxDeltas({
+          txid: tx.hash,
+          blockIndex: tx.index,
+          height: tx.height,
+          address
+        }, tx, ['prevtxid', 'prevout'])
       ))
       .reduce((res, cur) => res.concat(cur), [])
-      .sort((a, b) => a.height > b.height ? 1 : -1 )
+      .sort((a, b) => a.height > b.height ? 1 : -1)
+  }
+
+  async _getAddressBalance (args, help) {
+    if (help) {
+      throw new RPCError(
+        errors.MISC,
+        'getaddressbalance ' +
+        '\'{"addresses": [<address>,...]}')
+    }
+
+    const { addresses } = this.validateArgs(args)
+
+    const txs =
+      await this.getAddressTxs(addresses, 0, Infinity)
+
+    const deltas = txs
+      .map(({ tx, address }) => (
+        this.getTxDeltas({
+          txid: tx.hash,
+          blockIndex: tx.index,
+          height: tx.height,
+          address
+        }, tx, ['prevtxid', 'prevout'])
+      ))
+      .reduce((res, cur) => res.concat(cur), [])
+      .sort((a, b) => a.height > b.height ? 1 : -1)
+
+    return {
+      balance: deltas.reduce((total, delta) => (
+        total + delta.satoshis
+      ), 0),
+      received: deltas
+        .filter((delta) => delta.satoshis > 0)
+        .reduce((total, delta) => (
+          total + delta.satoshis
+        ), 0)
+    }
+  }
+
+  async _getAddressUtxos (args, help) {
+    if (help) {
+      throw new RPCError(
+        errors.MISC,
+        'getaddressutxos ' +
+        '\'{"addresses": [<address>,...]}')
+    }
+
+    const { addresses } = this.validateArgs(args)
+
+    const txs =
+      await this.getAddressTxs(addresses, 0, Infinity)
+
+    return txs.map(({ tx, address }) => (
+      tx.outputs
+        .map((output, index) => ({ output, index }))
+        .filter(({ output }) => output.address === address)
+        .map(({ output, index }) => ({
+          address,
+          txid: tx.hash,
+          outputIndex: index,
+          script: output.script,
+          satoshis: output.value * 1e8,
+          height: tx.height
+        })
+    ))).reduce((res, cur) => res.concat(cur), [])
+  }
+
+  async _getAddressMempool (args, help) {
+    if (help) {
+      throw new RPCError(
+        errors.MISC,
+        'getaddressmempool ' +
+        '\'{"addresses": [<address>,...]}')
+    }
+
+    const { addresses } = this.validateArgs(args)
+
+    const txs =
+      await this.getAddressTxs(addresses, -1, -1)
+
+    return txs
+      .map(({ tx, address }) => (
+        this.getTxDeltas({
+          txid: tx.hash,
+          timestamp: tx.ts,
+          address
+        }, tx)
+      ))
+      .reduce((res, cur) => res.concat(cur), [])
+      .sort((a, b) => a.height > b.height ? 1 : -1)
   }
 }
 

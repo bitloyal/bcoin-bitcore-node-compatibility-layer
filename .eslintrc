@@ -1,0 +1,17 @@
+{
+  "extends": [
+    "standard"
+  ],
+  "plugins": [
+    "mocha",
+    "promise"
+  ],
+  "env": {
+    "node": true
+  },
+  "rules": {
+    "key-spacing"          : 0,
+    "max-len"              : [2, 120, 2],
+    "object-curly-spacing" : [2, "always"]
+  }
+}

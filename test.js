@@ -1,3 +1,4 @@
+/* global describe it */
 const assert = require('assert')
 
 const consensus = require('bcoin/lib/protocol/consensus')
@@ -19,10 +20,12 @@ describe('BitcoreNodeCompatibilityLayer', function () {
   node.on('error', () => {})
 
   const chain = node.chain
+  const mempool = node.mempool
   const walletdb = node.use(WalletDB)
-  const bncl = node.use(BitcoreNodeCompatibilityLayer)
   const miner = node.miner
   const client = new RPCClient({ network: 'regtest' })
+
+  node.use(BitcoreNodeCompatibilityLayer)
 
   const blocks = []
   const receives = []
@@ -31,20 +34,23 @@ describe('BitcoreNodeCompatibilityLayer', function () {
   const confirmed = []
 
   let wallet
+  let balance, received, deltas, udeltas
 
   const mineBlock = async () => {
     miner.addresses.length = 0
     changes.push(wallet.getChange())
-    miner.addAddress(changes[changes.length-1])
+    miner.addAddress(changes[changes.length - 1])
     const job = await miner.createJob()
     let tx
-    while (tx = unconfirmed.pop()) {
+    while (true) {
+      tx = unconfirmed.pop()
+      if (!tx) break
       job.addTX(tx, new CoinView())
       confirmed.push(tx)
     }
     job.refresh()
     blocks.push(await job.mineAsync())
-    await chain.add(blocks[blocks.length-1])
+    await chain.add(blocks[blocks.length - 1])
     await walletdb.rescan()
   }
 
@@ -53,13 +59,47 @@ describe('BitcoreNodeCompatibilityLayer', function () {
     while (n--) {
       unconfirmed.push(await wallet.send({
         outputs: [{
-          address: receives[receives.length-1],
-          value: 25*1e8
+          address: receives[receives.length - 1],
+          value: 25 * 1e8
         }]
       }))
     }
     await walletdb.rescan()
   }
+
+  const assertDelta =
+    async (delta, address, index, satoshis) => {
+      const hash = await chain.db.getHash(delta.height)
+      const block = await node.getBlock(hash)
+      const tx = block.txs[delta.blockIndex]
+      const meta = await node.getMeta(tx.hash('hex'))
+      assert(JSON.stringify(delta) === JSON.stringify({
+        txid: tx.rhash('hex'),
+        blockIndex: meta.index,
+        height: meta.height,
+        address,
+        index,
+        satoshis
+      }))
+    }
+
+  const assertUDelta =
+    async (delta, address, index, satoshis) => {
+      const tx = mempool.getTXByAddress(address)[0]
+      const entry = mempool.getEntry(tx.hash('hex'))
+      const udelta = {
+        txid: tx.rhash('hex'),
+        timestamp: entry.ts,
+        address,
+        index,
+        satoshis
+      }
+      if (udelta.satoshis < 0) {
+        udelta.prevtxid = tx.inputs[udelta.index].prevout.hash
+        udelta.prevout = tx.inputs[udelta.index].prevout.index
+      }
+      assert(JSON.stringify(delta) === JSON.stringify(udelta))
+    }
 
   it('should open chain and miner', async () => {
     miner.mempool = null
@@ -88,7 +128,7 @@ describe('BitcoreNodeCompatibilityLayer', function () {
     const res = await client.execute('getaddresstxids', [{
       addresses: [receives[0].toString()]
     }])
-    assert(res[0] === unconfirmed[0].rhash().toString('hex'))
+    assert(res[0] === unconfirmed[0].rhash('hex'))
   })
 
   it('should receive tx ids in db by address', async () => {
@@ -98,7 +138,7 @@ describe('BitcoreNodeCompatibilityLayer', function () {
       start: 0,
       end: 2
     }])
-    assert(res[0] === confirmed[0].rhash().toString('hex'))
+    assert(res[0] === confirmed[0].rhash('hex'))
   })
 
   it('should receive no tx ids in db by address (bad range)', async () => {
@@ -112,15 +152,16 @@ describe('BitcoreNodeCompatibilityLayer', function () {
   it('should receive many tx ids for many addresses', async () => {
     await sendTransactions(1)
     await mineBlock()
+    const addresses = [
+      receives[0].toString(),
+      receives[1].toString()
+    ]
     const res = await client.execute('getaddresstxids', [{
-      addresses: [
-        receives[0].toString(),
-        receives[1].toString()
-      ],
+      addresses,
       start: 0
     }])
-    assert(res[0] === confirmed[0].rhash().toString('hex'))
-    assert(res[1] === confirmed[1].rhash().toString('hex'))
+    assert(res[0] === confirmed[0].rhash('hex'))
+    assert(res[1] === confirmed[1].rhash('hex'))
   })
 
   it('should receive many deltas for many addresses', async () => {
@@ -130,30 +171,70 @@ describe('BitcoreNodeCompatibilityLayer', function () {
       changes[0].toString(),
       receives[0].toString()
     ]
-    const res = await client.execute('getaddressdeltas', [{
+    deltas = await client.execute('getaddressdeltas', [{
       addresses,
       start: 0
     }])
 
-    const assertDelta =
-      async (delta, address, index, satoshis) => {
-        const hash = await chain.db.getHash(delta.height)
-        const block = await node.getBlock(hash)
-        const tx = block.txs[delta.blockIndex]
-        const meta = await node.getMeta(tx.hash().toString('hex'))
-        assert(JSON.stringify(delta) === JSON.stringify({
-          txid: tx.rhash().toString('hex'),
-          blockIndex: meta.index,
-          height: meta.height,
-          address,
-          index,
-          satoshis
-        }))
-      }
+    await assertDelta(deltas[0], addresses[0], 0, 50 * 1e8)
+    await assertDelta(deltas[1], addresses[0], 0, 50 * -1e8)
+    await assertDelta(deltas[2], addresses[1], 1, 25 * 1e8)
 
-    await assertDelta(res[0], addresses[0], 0, 50 * 1e8)
-    await assertDelta(res[1], addresses[0], 0, 50 * -1e8)
-    await assertDelta(res[2], addresses[1], 1, 25 * 1e8)
+    balance = deltas.reduce((total, delta) => (
+      total + delta.satoshis
+    ), 0)
+
+    received = deltas.filter((delta) => delta.satoshis > 0)
+      .reduce((total, delta) => (
+        total + delta.satoshis
+      ), 0)
+  })
+
+  it('should receive a balance for many addresses', async () => {
+    const addresses = [
+      changes[0].toString(),
+      receives[0].toString()
+    ]
+    const res = await client.execute('getaddressbalance', [{
+      addresses
+    }])
+
+    assert(res.balance === balance)
+    assert(res.received === received)
+  })
+
+  it('should receive utxos for many addresses', async () => {
+    const addresses = [
+      changes[0].toString(),
+      receives[0].toString()
+    ]
+    const res = await client.execute('getaddressutxos', [{
+      addresses
+    }])
+
+    const pdeltas = deltas.filter((delta) => delta.satoshis > 0)
+    res.map((utxo, n) => (
+      assert(JSON.stringify(utxo) === JSON.stringify({
+        address: pdeltas[n].address,
+        txid: pdeltas[n].txid,
+        outputIndex: pdeltas[n].index,
+        script: utxo.script,
+        satoshis: pdeltas[n].satoshis,
+        height: pdeltas[n].height
+      }))
+    ))
+  })
+
+  it('should receive many unconfirmed deltas for many addresses', async () => {
+    await sendTransactions(1)
+    const addresses = [
+      receives[receives.length - 1].toString()
+    ]
+    udeltas = await client.execute('getaddressmempool', [{
+      addresses
+    }])
+
+    await assertUDelta(udeltas[0], addresses[0], 1, 25 * 1e8)
   })
 
   it('should cleanup', async () => {

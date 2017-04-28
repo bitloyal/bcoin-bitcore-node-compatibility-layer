@@ -3,6 +3,10 @@
   "version": "0.0.1",
   "description": "A bcoin plugin that adds rpc methods required by bitcore-node",
   "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitlab.com/homeopatchy/bcoin-bitcore-node-compatibility-layer.git"
+  },
   "keywords": [
     "bcoin",
     "plugin",
@@ -11,7 +15,8 @@
     "rpc"
   ],
   "scripts": {
-    "test": "mocha --reporter spec test.js"
+    "test": "mocha --reporter spec test.js",
+    "lint": "eslint index.js test.js"
   },
   "author": "homeopatchy",
   "license": "MIT",
@@ -19,6 +24,13 @@
     "bcoin": "^1.0.0-beta.12"
   },
   "devDependencies": {
+    "eslint": "^3.19.0",
+    "eslint-config-standard": "^10.2.1",
+    "eslint-plugin-import": "^2.2.0",
+    "eslint-plugin-mocha": "^4.9.0",
+    "eslint-plugin-node": "^4.2.2",
+    "eslint-plugin-promise": "^3.5.0",
+    "eslint-plugin-standard": "^3.0.1",
     "mocha": "^3.2.0"
   }
 }
